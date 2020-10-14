@@ -5,10 +5,9 @@ import (
 	"os"
 )
 
-func startTestClient(serverAddress string, clientAddress string) {
+func startTestClient(serverEndpoint string) {
 	client, err := NewClient(ClientConfig{
-		ListenAddress: clientAddress,
-		ServerAddress: serverAddress,
+		ServerEndpoint: serverEndpoint,
 	})
 	if err != nil {
 		log.WithError(err).Error("Failed to start client")
@@ -26,6 +25,6 @@ func initLogging() {
 func main() {
 	initLogging()
 
-	startTestClient("server.abbysoft.org:27015", "0.0.0.0:27016")
+	startTestClient("tcp://192.168.1.105:27015")
 	//startTestClient("192.168.1.105:27015", "0.0.0.0:27016")
 }

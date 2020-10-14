@@ -3,48 +3,45 @@ package main
 import (
 	"fmt"
 	"github.com/golang/protobuf/proto"
+	zmq "github.com/pebbe/zmq4"
 	log "github.com/sirupsen/logrus"
-	"net"
-	"projectx-tester/common"
 	rpc "projectx-tester/rpc/generated"
 	"time"
 )
 
 type Client struct {
-	socket        *net.UDPConn
-	listenAddress *net.UDPAddr
-	serverAddress *net.UDPAddr
-	logger        *log.Entry
+	socket  *zmq.Socket
+	context *zmq.Context
+	logger  *log.Entry
+	config  ClientConfig
 }
 
 type ClientConfig struct {
-	ListenAddress string
-	ServerAddress string
+	ServerEndpoint string
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
-	listenAddress, err := net.ResolveUDPAddr("udp", config.ListenAddress)
+	context, err := zmq.NewContext()
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve listen address: %w", err)
+		return nil, fmt.Errorf("failed to create zmq context: %w", err)
 	}
 
-	serverAddress, err := net.ResolveUDPAddr("udp", config.ServerAddress)
+	socket, err := zmq.NewSocket(zmq.REQ)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve server address: %w", err)
+		return nil, fmt.Errorf("failed to create zmq socket: %w", err)
 	}
 
-	conn, err := net.DialUDP("udp", listenAddress, serverAddress)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create client socket: %w", err)
+	if err := socket.Connect(config.ServerEndpoint); err != nil {
+		return nil, fmt.Errorf("failed to connect to the server: %w", err)
 	}
 
 	logger := log.WithField("module", "Client")
 
 	return &Client{
-		socket:        conn,
-		listenAddress: listenAddress,
-		serverAddress: serverAddress,
-		logger:        logger,
+		socket:  socket,
+		logger:  logger,
+		config:  config,
+		context: context,
 	}, nil
 }
 
@@ -74,75 +71,57 @@ func generateRandomRequest() (request rpc.Request) {
 func (c *Client) Serve() {
 	defer c.socket.Close()
 
-	go c.readResponses()
+	firstTime := true
 	for {
+		if !firstTime {
+			time.Sleep(5 * time.Second)
+		}
+
+		firstTime = false
+
 		request := generateRandomRequest()
 
-		if err, _ := common.WriteResponse(&request, nil, c.socket); err != nil {
-			c.logger.WithError(err).Error("Failed to write request")
+		requestBytes, err := proto.Marshal(&request)
+		if err != nil {
+			c.logger.WithError(err).Error("Failed to marshal request")
+			continue
+		}
+
+		c.logger.WithFields(log.Fields{
+			"server":  c.config.ServerEndpoint,
+			"request": fmt.Sprintf("%T", request.Data),
+		}).Info("Send request to the server")
+
+		if _, err := c.socket.Send(string(requestBytes), zmq.DONTWAIT); err != nil {
+			c.logger.WithError(err).Error("Failed to send request to the server")
+			continue
 		}
 
 		c.logger.Printf("%T sent to the server", request.Data)
-		time.Sleep(5 * time.Second)
-	}
-}
 
-func (c *Client) readResponses() {
-	var buffer [1024]byte
-	for {
-		bytesRead, err := c.socket.Read(buffer[0:])
-		if err != nil {
+		if err := c.readResponse(); err != nil {
 			c.logger.WithError(err).Error("Failed to read response from the server")
-			continue
 		}
-
-		var response rpc.Response
-		if err := proto.Unmarshal(buffer[0:bytesRead], &response); err != nil {
-			c.logger.WithError(err).Error("Failed to deserialize server response")
-			continue
-		}
-
-		if response.GetMultipartResponse() != nil {
-			c.logger.
-				WithField("parts", response.GetMultipartResponse().Parts).
-				Infof("Server respond with multipart response")
-
-			actualResponse, err := c.readMultipartResponse(int(response.GetMultipartResponse().Parts))
-			if err != nil {
-				c.logger.WithError(err).Error("Failed to read multipart response")
-				continue
-			}
-
-			response.Data = actualResponse.Data
-		}
-
-		c.logger.
-			WithField("response", response.Data).
-			Infof("Server respond with %d bytes", bytesRead)
 	}
 }
 
-func (c *Client) readMultipartResponse(parts int) (*rpc.Response, error) {
-	var buffer [common.MaxPacketSize]byte
-	var resultBuffer []byte
-
-	for parts > 0 {
-		bytesRead, err := c.socket.Read(buffer[0:])
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response from the server")
-		}
-
-		resultBuffer = append(resultBuffer, buffer[0:bytesRead]...)
-		c.logger.WithField("length", bytesRead).Debugf("Read response part (%d left)", parts)
-
-		parts--
+func (c *Client) readResponse() error {
+	bytesRead, err := c.socket.Recv(0)
+	if err != nil {
+		return fmt.Errorf("failed to read response from the server: %w", err)
 	}
 
-	c.logger.Debugf("Unmarshal part (%d bytes)", len(resultBuffer))
 	var response rpc.Response
-	if err := proto.Unmarshal(resultBuffer, &response); err != nil {
-		return nil, fmt.Errorf("failed to serialize response: %v", err)
+	if err := proto.Unmarshal([]byte(bytesRead), &response); err != nil {
+		return fmt.Errorf("failed to unmarshal server response: %w", err)
 	}
 
-	return &response, nil
+	if response.GetMultipartResponse() != nil {
+		return fmt.Errorf("multipart response received")
+	}
+
+	c.logger.
+		WithField("response", response.Data).
+		Infof("Server respond with %d bytes", len(bytesRead))
+	return nil
 }
